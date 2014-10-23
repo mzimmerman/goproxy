@@ -38,7 +38,7 @@ func getBrowser(args []string) string {
 }
 
 func TestSingerTls(t *testing.T) {
-	cert, err := signHost(GoproxyCa, []string{"example.com", "1.1.1.1", "localhost"})
+	cert, err := SignHost(GoproxyCa, []string{"example.com", "1.1.1.1", "localhost"})
 	orFatal("singHost", err, t)
 	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
 	orFatal("ParseCertificate", err, t)
@@ -71,7 +71,7 @@ func TestSingerTls(t *testing.T) {
 }
 
 func TestSingerX509(t *testing.T) {
-	cert, err := signHost(GoproxyCa, []string{"example.com", "1.1.1.1", "localhost"})
+	cert, err := SignHost(GoproxyCa, []string{"example.com", "1.1.1.1", "localhost"})
 	orFatal("singHost", err, t)
 	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
 	orFatal("ParseCertificate", err, t)

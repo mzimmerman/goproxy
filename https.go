@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,11 +19,12 @@ import (
 type ConnectActionLiteral int
 
 const (
-	ConnectAccept = iota
+	ConnectAccept ConnectActionLiteral = iota
 	ConnectReject
 	ConnectMitm
 	ConnectHijack
 	ConnectHTTPMitm
+	ConnectTransparentHijack
 )
 
 var (
@@ -61,6 +63,86 @@ func (proxy *ProxyHttpServer) connectDial(network, addr string) (c net.Conn, err
 	return proxy.ConnectDial(network, addr)
 }
 
+func (proxy *ProxyHttpServer) HandleHttpsConn(c net.Conn, host string) {
+	ca := &GoproxyCa
+	cert, err := SignHost(*ca, []string{host})
+	if err != nil {
+		log.Printf("Cannot sign host certificate with provided CA: %s", err)
+		return
+	}
+	tlsConfig := *defaultTlsConfig
+	tlsConfig.Certificates = append(tlsConfig.Certificates, cert)
+	rawClientTls := tls.Server(c, &tlsConfig)
+	if err := rawClientTls.Handshake(); err != nil {
+		log.Printf("Cannot handshake client %v %v", host, err)
+		return
+	}
+	defer rawClientTls.Close()
+	clientTlsReader := bufio.NewReader(rawClientTls)
+	for !IsEof(clientTlsReader) {
+		req, err := http.ReadRequest(clientTlsReader)
+		if err != nil && err != io.EOF {
+			return
+		}
+		if err != nil {
+			log.Printf("Cannot read TLS request from mitm'd client %v %v", host, err)
+			return
+		}
+		ctx := &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
+		req.URL, err = url.Parse("https://" + req.Host + req.URL.String())
+		req, resp := proxy.filterRequest(req, ctx)
+		if resp == nil {
+			if err != nil {
+				ctx.Warnf("Illegal URL %s", "https://"+req.Host+req.URL.Path)
+				return
+			}
+			removeProxyHeaders(ctx, req)
+			resp, err = ctx.RoundTrip(req)
+			if err != nil {
+				ctx.Warnf("Cannot read TLS response from mitm'd server %v", err)
+				return
+			}
+			ctx.Logf("resp %v", resp.Status)
+		}
+		resp = proxy.filterResponse(resp, ctx)
+		text := resp.Status
+		statusCode := strconv.Itoa(resp.StatusCode) + " "
+		if strings.HasPrefix(text, statusCode) {
+			text = text[len(statusCode):]
+		}
+		// always use 1.1 to support chunked encoding
+		if _, err := io.WriteString(rawClientTls, "HTTP/1.1"+" "+statusCode+text+"\r\n"); err != nil {
+			ctx.Warnf("Cannot write TLS response HTTP status from mitm'd client: %v", err)
+			return
+		}
+		// Since we don't know the length of resp, return chunked encoded response
+		// TODO: use a more reasonable scheme
+		resp.Header.Del("Content-Length")
+		resp.Header.Set("Transfer-Encoding", "chunked")
+		if err := resp.Header.Write(rawClientTls); err != nil {
+			ctx.Warnf("Cannot write TLS response header from mitm'd client: %v", err)
+			return
+		}
+		if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+			ctx.Warnf("Cannot write TLS response header end from mitm'd client: %v", err)
+			return
+		}
+		chunked := newChunkedWriter(rawClientTls)
+		if _, err := io.Copy(chunked, resp.Body); err != nil {
+			ctx.Warnf("Cannot write TLS response body from mitm'd client: %v", err)
+			return
+		}
+		if err := chunked.Close(); err != nil {
+			ctx.Warnf("Cannot write TLS chunked EOF from mitm'd client: %v", err)
+			return
+		}
+		if _, err = io.WriteString(rawClientTls, "\r\n"); err != nil {
+			ctx.Warnf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
+			return
+		}
+	}
+}
+
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
 
@@ -78,11 +160,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 	todo, host := OkConnect, r.URL.Host
 	for i, h := range proxy.httpsHandlers {
 		newtodo, newhost := h.HandleConnect(host, ctx)
-		
+
 		// If found a result, break the loop immediately
 		if newtodo != nil {
 			todo, host = newtodo, newhost
-			ctx.Logf("on %dth handler: %v %s", i, todo, host)
+			ctx.Logf("on %dth handler: %#v %s", i, todo, host)
 			break
 		}
 	}
@@ -147,11 +229,13 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		// still handling the request even after hijacking the connection. Those HTTP CONNECT
 		// request can take forever, and the server will be stuck when "closed".
 		// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
+		fallthrough
+	case ConnectTransparentHijack:
 		ca := todo.Ca
 		if ca == nil {
 			ca = &GoproxyCa
 		}
-		cert, err := signHost(*ca, []string{stripPort(host)})
+		cert, err := SignHost(*ca, []string{stripPort(host)})
 		if err != nil {
 			ctx.Warnf("Cannot sign host certificate with provided CA: %s", err)
 			return
@@ -172,7 +256,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 			defer rawClientTls.Close()
 			clientTlsReader := bufio.NewReader(rawClientTls)
-			for !isEof(clientTlsReader) {
+			for !IsEof(clientTlsReader) {
 				req, err := http.ReadRequest(clientTlsReader)
 				if err != nil && err != io.EOF {
 					return
