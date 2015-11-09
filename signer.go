@@ -30,7 +30,7 @@ func hashSortedBigInt(lst []string) *big.Int {
 	return rv
 }
 
-var goproxySignerVersion = ":goroxy1"
+var goproxySignerVersion = ":goproxy1"
 
 func signHost(ca tls.Certificate, hosts []string) (cert tls.Certificate, err error) {
 	var x509ca *x509.Certificate
@@ -38,11 +38,6 @@ func signHost(ca tls.Certificate, hosts []string) (cert tls.Certificate, err err
 	// Use the provided ca and not the global GoproxyCa for certificate generation.
 	if x509ca, err = x509.ParseCertificate(ca.Certificate[0]); err != nil {
 		return
-	}
-	start := time.Unix(0, 0)
-	end, err := time.Parse("2006-01-02", "2049-12-31")
-	if err != nil {
-		panic(err)
 	}
 	hash := hashSorted(append(hosts, goproxySignerVersion, ":"+runtime.Version()))
 	serial := new(big.Int)
@@ -54,13 +49,14 @@ func signHost(ca tls.Certificate, hosts []string) (cert tls.Certificate, err err
 		Subject: pkix.Name{
 			Organization: []string{"GoProxy untrusted MITM proxy Inc"},
 		},
-		NotBefore: start,
-		NotAfter:  end,
+		NotBefore: time.Now().Add(-time.Hour * 24),
+		NotAfter:  time.Now().Add(time.Hour * 24),
 
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
+	template.Subject.CommonName = hosts[0]
 	for _, h := range hosts {
 		if ip := net.ParseIP(h); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
@@ -73,7 +69,7 @@ func signHost(ca tls.Certificate, hosts []string) (cert tls.Certificate, err err
 		return
 	}
 	var certpriv *rsa.PrivateKey
-	if certpriv, err = rsa.GenerateKey(&csprng, 1024); err != nil {
+	if certpriv, err = rsa.GenerateKey(&csprng, 2048); err != nil {
 		return
 	}
 	var derBytes []byte
